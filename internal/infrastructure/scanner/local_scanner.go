@@ -9,12 +9,10 @@ import (
 	"github.com/alanshabrandi/astria/internal/domain"
 )
 
-// LocalScanner implements the domain.FileScanner interface using a concurrent Worker Pool pattern.
 type LocalScanner struct {
 	workerCount int
 }
 
-// NewLocalScanner creates a new instance of LocalScanner with a specified pool size.
 func NewLocalScanner(workerCount int) *LocalScanner {
 	if workerCount <= 0 {
 		workerCount = 4
@@ -24,15 +22,15 @@ func NewLocalScanner(workerCount int) *LocalScanner {
 	}
 }
 
-// Scan walks the given directory and uses a pool of workers to concurrently read file contents.
 func (s *LocalScanner) Scan(ctx context.Context, rootDir string) (<-chan domain.SourceFile, <-chan error) {
 	filesChan := make(chan domain.SourceFile, s.workerCount*2)
 	errChan := make(chan error, 10)
 	pathsChan := make(chan string, s.workerCount*2)
 
+	filter := NewFilter(rootDir)
 	var wg sync.WaitGroup
 
-	// 1. Worker Pool to process file reading concurrently
+	// Worker Pool
 	for i := 0; i < s.workerCount; i++ {
 		wg.Add(1)
 		go func() {
@@ -72,7 +70,7 @@ func (s *LocalScanner) Scan(ctx context.Context, rootDir string) (<-chan domain.
 		}()
 	}
 
-	// 2. Traversal Routine to stream file paths into worker pool
+	// Traversal with early directory pruning and ignore rules
 	go func() {
 		defer close(pathsChan)
 
@@ -84,13 +82,25 @@ func (s *LocalScanner) Scan(ctx context.Context, rootDir string) (<-chan domain.
 				return ctx.Err()
 			}
 
-			if !d.IsDir() {
-				select {
-				case pathsChan <- path:
-				case <-ctx.Done():
-					return ctx.Err()
+			// Prune entire directory tree if ignored (e.g. .git, node_modules)
+			if d.IsDir() {
+				if path != rootDir && filter.ShouldIgnore(path, true) {
+					return filepath.SkipDir
 				}
+				return nil
 			}
+
+			// Filter files based on extensions or .gitignore rules
+			if filter.ShouldIgnore(path, false) {
+				return nil
+			}
+
+			select {
+			case pathsChan <- path:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+
 			return nil
 		})
 
@@ -99,7 +109,7 @@ func (s *LocalScanner) Scan(ctx context.Context, rootDir string) (<-chan domain.
 		}
 	}()
 
-	// 3. Cleanup Routine to wait for workers and safely close output channels
+	// Cleanup
 	go func() {
 		wg.Wait()
 		close(filesChan)
