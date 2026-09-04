@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -30,10 +31,10 @@ func (s *LocalScanner) Scan(ctx context.Context, rootDir string) (<-chan domain.
 	filter := NewFilter(rootDir)
 	var wg sync.WaitGroup
 
-	// Worker Pool
+	// Worker Pool for reading files
 	for i := 0; i < s.workerCount; i++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
 			for path := range pathsChan {
 				select {
@@ -42,12 +43,14 @@ func (s *LocalScanner) Scan(ctx context.Context, rootDir string) (<-chan domain.
 				default:
 					info, err := os.Stat(path)
 					if err != nil {
+						slog.Warn("Failed to stat file, skipping", "path", path, "error", err.Error(), "worker", workerID)
 						s.sendError(ctx, errChan, err)
 						continue
 					}
 
 					content, err := os.ReadFile(path)
 					if err != nil {
+						slog.Warn("Failed to read file due to lock or permission, skipping", "path", path, "error", err.Error(), "worker", workerID)
 						s.sendError(ctx, errChan, err)
 						continue
 					}
@@ -67,30 +70,35 @@ func (s *LocalScanner) Scan(ctx context.Context, rootDir string) (<-chan domain.
 					}
 				}
 			}
-		}()
+		}(i)
 	}
 
-	// Traversal with early directory pruning and ignore rules
+	// Traversal Routine
 	go func() {
 		defer close(pathsChan)
 
 		err := filepath.WalkDir(rootDir, func(path string, d os.DirEntry, err error) error {
+			// Day 5: Error handling for unreadable paths (e.g. Permission Denied)
 			if err != nil {
-				return err
+				slog.Warn("Access denied or error accessing path during walk", "path", path, "error", err.Error())
+				if d != nil && d.IsDir() {
+					return filepath.SkipDir // Skip bad directories instead of crashing
+				}
+				return nil // Skip bad files
 			}
+
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 
-			// Prune entire directory tree if ignored (e.g. .git, node_modules)
 			if d.IsDir() {
 				if path != rootDir && filter.ShouldIgnore(path, true) {
+					slog.Debug("Skipping directory based on filter rules", "dir", path)
 					return filepath.SkipDir
 				}
 				return nil
 			}
 
-			// Filter files based on extensions or .gitignore rules
 			if filter.ShouldIgnore(path, false) {
 				return nil
 			}
@@ -105,15 +113,17 @@ func (s *LocalScanner) Scan(ctx context.Context, rootDir string) (<-chan domain.
 		})
 
 		if err != nil && ctx.Err() == nil {
+			slog.Error("Critical error during directory walk", "error", err.Error())
 			s.sendError(ctx, errChan, err)
 		}
 	}()
 
-	// Cleanup
+	// Cleanup Routine
 	go func() {
 		wg.Wait()
 		close(filesChan)
 		close(errChan)
+		slog.Info("File scanning completed successfully")
 	}()
 
 	return filesChan, errChan
