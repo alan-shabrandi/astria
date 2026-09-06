@@ -2,14 +2,16 @@ package parser
 
 import (
 	"fmt"
+	"strings"
 
 	sitter "github.com/smacker/go-tree-sitter"
 )
 
 // StructuralNode represents an extracted piece of code like a Struct, Interface, or Class.
 type StructuralNode struct {
-	Type       string       // "Struct", "Interface", "Class"
-	Name       string       // Name of the structure
+	Type       string // "Struct", "Interface", "Class"
+	Name       string // Name of the structure
+	DocComment string
 	StartPoint sitter.Point // Line and column where it starts
 	EndPoint   sitter.Point // Line and column where it ends
 	Content    string       // The actual raw code block
@@ -20,6 +22,7 @@ type FunctionNode struct {
 	IsMethod   bool
 	Receiver   string // Only for methods (e.g., "(e *Engine)")
 	Name       string
+	DocComment string
 	Parameters string
 	Returns    string
 	StartPoint sitter.Point
@@ -91,6 +94,7 @@ func (e *Extractor) ExtractStructures(tree *sitter.Tree, content []byte, extensi
 				node.StartPoint = capturedNode.StartPoint()
 				node.EndPoint = capturedNode.EndPoint()
 				node.Content = capturedNode.Content(content)
+				node.DocComment = e.extractDocComment(capturedNode, content, extension)
 			}
 		}
 
@@ -158,6 +162,7 @@ func (e *Extractor) ExtractFunctions(tree *sitter.Tree, content []byte, extensio
 				currentNode.StartPoint = capturedNode.StartPoint()
 				currentNode.EndPoint = capturedNode.EndPoint()
 				currentNode.Content = capturedText
+				currentNode.DocComment = e.extractDocComment(capturedNode, content, extension)
 			}
 		}
 
@@ -228,4 +233,31 @@ func (e *Extractor) getFunctionQuery(extension string) string {
 	default:
 		return ""
 	}
+}
+
+func (e *Extractor) extractDocComment(node *sitter.Node, content []byte, extension string) string {
+	if extension == ".go" {
+		var comments []string
+		prev := node.PrevNamedSibling()
+
+		for prev != nil && prev.Type() == "comment" {
+			comments = append([]string{prev.Content(content)}, comments...)
+			prev = prev.PrevNamedSibling()
+		}
+		return strings.Join(comments, "\n")
+
+	} else if extension == ".py" {
+		block := node.ChildByFieldName("body")
+		if block != nil && block.NamedChildCount() > 0 {
+			firstStmt := block.NamedChild(0)
+			if firstStmt.Type() == "expression_statement" {
+				strNode := firstStmt.NamedChild(0)
+				if strNode != nil && strNode.Type() == "string" {
+					return strNode.Content(content)
+				}
+			}
+		}
+	}
+
+	return ""
 }
