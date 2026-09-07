@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"time"
 
@@ -14,16 +15,17 @@ import (
 const (
 	openAIEndpoint = "https://api.openai.com/v1/embeddings"
 	defaultModel   = "text-embedding-3-small"
-	dimensions     = 1536
+
+	maxRetries = 4
+	baseDelay  = 1 * time.Second
+	maxDelay   = 15 * time.Second
 )
 
-// openAIRequest represents the JSON payload sent to the API.
 type openAIRequest struct {
 	Input []string `json:"input"`
 	Model string   `json:"model"`
 }
 
-// openAIResponse represents the JSON response received from the API.
 type openAIResponse struct {
 	Data []struct {
 		Embedding []float32 `json:"embedding"`
@@ -33,35 +35,29 @@ type openAIResponse struct {
 	} `json:"error,omitempty"`
 }
 
-// OpenAIProvider implements domain.EmbeddingProvider using the OpenAI REST API.
 type OpenAIProvider struct {
 	client *http.Client
 	apiKey string
 	model  string
 }
 
-// NewOpenAIProvider initializes the provider with a robust, production-ready HTTP client.
 func NewOpenAIProvider(apiKey string) *OpenAIProvider {
 	transport := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
 		IdleConnTimeout:     90 * time.Second,
-		DisableKeepAlives:   false,
 	}
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   30 * time.Second,
-	}
-
 	return &OpenAIProvider{
-		client: client,
+		client: &http.Client{
+			Transport: transport,
+			Timeout:   30 * time.Second,
+		},
 		apiKey: apiKey,
 		model:  defaultModel,
 	}
 }
 
-// GenerateEmbeddings converts a batch of texts into vector representations.
+// GenerateEmbeddings converts a batch of texts into vector representations using Exponential Backoff.
 func (p *OpenAIProvider) GenerateEmbeddings(ctx context.Context, texts []string) ([]domain.Vector, error) {
 	if len(texts) == 0 {
 		return nil, nil
@@ -77,9 +73,52 @@ func (p *OpenAIProvider) GenerateEmbeddings(ctx context.Context, texts []string)
 		return nil, fmt.Errorf("failed to marshal openai request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, openAIEndpoint, bytes.NewReader(jsonData))
+	var lastErr error
+	delay := baseDelay
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("context cancelled during embedding generation: %w", err)
+		}
+
+		apiResp, retryable, err := p.doSingleRequest(ctx, jsonData)
+		if err == nil {
+			vectors := make([]domain.Vector, len(apiResp.Data))
+			for i, d := range apiResp.Data {
+				vectors[i] = d.Embedding
+			}
+			return vectors, nil
+		}
+
+		lastErr = err
+
+		if !retryable || attempt == maxRetries {
+			break
+		}
+
+		jitter := time.Duration(rand.Int63n(int64(delay) / 2))
+		sleepTime := delay + jitter
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context cancelled during retry wait: %w", ctx.Err())
+		case <-time.After(sleepTime):
+		}
+
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+
+	return nil, fmt.Errorf("failed after %d attempts, last error: %w", maxRetries+1, lastErr)
+}
+
+// doSingleRequest isolates a single HTTP call to prevent memory leaks from deferred Body closures in loops.
+func (p *OpenAIProvider) doSingleRequest(ctx context.Context, payload []byte) (*openAIResponse, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, openAIEndpoint, bytes.NewReader(payload))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create http request: %w", err)
+		return nil, false, fmt.Errorf("failed to create http request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -87,32 +126,24 @@ func (p *OpenAIProvider) GenerateEmbeddings(ctx context.Context, texts []string)
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("http request failed: %w", err)
+		return nil, true, fmt.Errorf("network request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	var apiResp openAIResponse
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return nil, fmt.Errorf("failed to decode api response: %w", err)
+		return nil, false, fmt.Errorf("failed to decode api response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		errMsg := "unknown error"
+		isRetryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError
+
+		errMsg := "unknown api error"
 		if apiResp.Error != nil {
 			errMsg = apiResp.Error.Message
 		}
-		return nil, fmt.Errorf("openai api error (status %d): %s", resp.StatusCode, errMsg)
+		return nil, isRetryable, fmt.Errorf("openai error (status %d): %s", resp.StatusCode, errMsg)
 	}
 
-	vectors := make([]domain.Vector, len(apiResp.Data))
-	for i, d := range apiResp.Data {
-		vectors[i] = d.Embedding
-	}
-
-	return vectors, nil
-}
-
-// Dimensions returns the exact vector size produced by this provider.
-func (p *OpenAIProvider) Dimensions() int {
-	return dimensions
+	return &apiResp, false, nil
 }
