@@ -147,3 +147,8 @@ func (p *OpenAIProvider) doSingleRequest(ctx context.Context, payload []byte) (*
 
 	return &apiResp, false, nil
 }
+
+// Dimensions returns the expected vector dimension for the embedding model.
+func (p *OpenAIProvider) Dimensions() int {
+	return 1536
+}
