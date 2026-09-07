@@ -12,15 +12,20 @@ const defaultBatchSize = 100
 // BatchEmbedder orchestrates batching and embedding generation for CodeChunks.
 type BatchEmbedder struct {
 	provider  domain.EmbeddingProvider
+	formatter ChunkFormatter
 	batchSize int
 }
 
-func NewBatchEmbedder(provider domain.EmbeddingProvider, batchSize int) *BatchEmbedder {
+func NewBatchEmbedder(provider domain.EmbeddingProvider, formatter ChunkFormatter, batchSize int) *BatchEmbedder {
 	if batchSize <= 0 {
 		batchSize = defaultBatchSize
 	}
+	if formatter == nil {
+		formatter = NewDefaultFormatter()
+	}
 	return &BatchEmbedder{
 		provider:  provider,
+		formatter: formatter,
 		batchSize: batchSize,
 	}
 }
@@ -49,7 +54,7 @@ func (b *BatchEmbedder) EmbedChunks(ctx context.Context, chunks []domain.CodeChu
 		payloads := make([]string, len(batch))
 
 		for j, chunk := range batch {
-			payloads[j] = chunk.PrepareForEmbedding()
+			payloads[j] = b.formatter.Format(chunk)
 		}
 
 		vectors, err := b.provider.GenerateEmbeddings(ctx, payloads)
