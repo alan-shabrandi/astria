@@ -3,17 +3,25 @@ package embedding
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/alanshabrandi/astria/internal/domain"
 )
 
-const defaultBatchSize = 100
+const (
+	defaultBatchSize   = 100
+	defaultMaxWorkers  = 5
+	defaultRequestRate = 200 * time.Millisecond
+)
 
-// BatchEmbedder orchestrates batching and embedding generation for CodeChunks.
 type BatchEmbedder struct {
-	provider  domain.EmbeddingProvider
-	formatter ChunkFormatter
-	batchSize int
+	provider    domain.EmbeddingProvider
+	formatter   ChunkFormatter
+	batchSize   int
+	maxWorkers  int
+	requestRate time.Duration
+	payloadPool sync.Pool
 }
 
 func NewBatchEmbedder(provider domain.EmbeddingProvider, formatter ChunkFormatter, batchSize int) *BatchEmbedder {
@@ -23,14 +31,23 @@ func NewBatchEmbedder(provider domain.EmbeddingProvider, formatter ChunkFormatte
 	if formatter == nil {
 		formatter = NewDefaultFormatter()
 	}
+
 	return &BatchEmbedder{
-		provider:  provider,
-		formatter: formatter,
-		batchSize: batchSize,
+		provider:    provider,
+		formatter:   formatter,
+		batchSize:   batchSize,
+		maxWorkers:  defaultMaxWorkers,
+		requestRate: defaultRequestRate,
+		payloadPool: sync.Pool{
+			New: func() any {
+				s := make([]string, 0, batchSize)
+				return &s
+			},
+		},
 	}
 }
 
-// EmbedChunks processes chunks in batches, updates their Vector fields, and returns them.
+// EmbedChunks processes chunks concurrently with memory pooling and rate limiting.
 func (b *BatchEmbedder) EmbedChunks(ctx context.Context, chunks []domain.CodeChunk) ([]domain.CodeChunk, error) {
 	if len(chunks) == 0 {
 		return chunks, nil
@@ -40,35 +57,74 @@ func (b *BatchEmbedder) EmbedChunks(ctx context.Context, chunks []domain.CodeChu
 	embeddedChunks := make([]domain.CodeChunk, totalChunks)
 	copy(embeddedChunks, chunks)
 
-	for i := 0; i < totalChunks; i += b.batchSize {
-		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("context cancelled during batch embedding processing: %w", err)
-		}
+	sem := make(chan struct{}, b.maxWorkers)
 
+	ticker := time.NewTicker(b.requestRate)
+	defer ticker.Stop()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 1)
+
+	for i := 0; i < totalChunks; i += b.batchSize {
 		end := i + b.batchSize
 		if end > totalChunks {
 			end = totalChunks
 		}
 
-		batch := embeddedChunks[i:end]
-		payloads := make([]string, len(batch))
-
-		for j, chunk := range batch {
-			payloads[j] = b.formatter.Format(chunk)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context cancelled before processing batch: %w", ctx.Err())
+		case <-ticker.C:
+		case err := <-errCh:
+			return nil, err
 		}
 
-		vectors, err := b.provider.GenerateEmbeddings(ctx, payloads)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate embeddings for batch [%d:%d]: %w", i, end, err)
-		}
+		wg.Add(1)
+		sem <- struct{}{}
 
-		if len(vectors) != len(batch) {
-			return nil, fmt.Errorf("vector length mismatch: expected %d, got %d", len(batch), len(vectors))
-		}
+		go func(startIndex, endIndex int) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-		for j := range batch {
-			embeddedChunks[i+j].Vector = vectors[j]
-		}
+			payloadsPtr := b.payloadPool.Get().(*[]string)
+			payloads := (*payloadsPtr)[:0]
+
+			defer b.payloadPool.Put(payloadsPtr)
+
+			batch := embeddedChunks[startIndex:endIndex]
+
+			for _, chunk := range batch {
+				payloads = append(payloads, b.formatter.Format(chunk))
+			}
+
+			vectors, err := b.provider.GenerateEmbeddings(ctx, payloads)
+			if err != nil {
+				select {
+				case errCh <- fmt.Errorf("batch [%d:%d] failed: %w", startIndex, endIndex, err):
+				default:
+				}
+				return
+			}
+
+			if len(vectors) != len(batch) {
+				select {
+				case errCh <- fmt.Errorf("vector length mismatch for batch [%d:%d]", startIndex, endIndex):
+				default:
+				}
+				return
+			}
+
+			for j := range batch {
+				embeddedChunks[startIndex+j].Vector = vectors[j]
+			}
+		}(i, end)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	if err := <-errCh; err != nil {
+		return nil, err
 	}
 
 	return embeddedChunks, nil
