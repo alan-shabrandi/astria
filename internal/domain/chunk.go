@@ -1,6 +1,10 @@
 package domain
 
-import "fmt"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+)
 
 // ChunkType defines the structural category of the extracted code.
 type ChunkType string
@@ -31,4 +35,13 @@ type CodeChunk struct {
 func (c *CodeChunk) PrepareForEmbedding() string {
 	return fmt.Sprintf("Type: %s\nName: %s\nSignature: %s\nDoc: %s\n\n%s",
 		c.Type, c.Name, c.Signature, c.DocComment, c.Content)
+}
+
+// CalculateHash generates a SHA-256 hash of the chunk's content and metadata
+// to identify identical code segments across indexing runs.
+func (c *CodeChunk) CalculateHash() string {
+	hasher := sha256.New()
+	data := fmt.Sprintf("%s:%s:%s", c.FilePath, c.Signature, c.Content)
+	hasher.Write([]byte(data))
+	return hex.EncodeToString(hasher.Sum(nil))
 }
