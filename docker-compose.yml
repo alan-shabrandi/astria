@@ -1,0 +1,23 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: astria_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: astria_user
+      POSTGRES_PASSWORD: astria_password
+      POSTGRES_DB: astria_db
+      TZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - astria_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U astria_user -d astria_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  astria_pg_data:
+    name: astria_pg_data

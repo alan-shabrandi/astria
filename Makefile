@@ -1,4 +1,4 @@
-.PHONY: build test lint clean
+.PHONY: build test lint clean db-up db-down db-logs db-shell
 
 APP_NAME=astria
 
@@ -13,3 +13,15 @@ lint:
 
 clean:
 	rm -rf bin/
+
+db-up:
+	docker compose up -d postgres
+
+db-down:
+	docker compose down
+
+db-logs:
+	docker compose logs -f postgres
+
+db-shell:
+	docker exec -it astria_postgres psql -U astria_user -d astria_db
