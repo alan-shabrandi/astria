@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_code_chunks_embedding_hnsw;
