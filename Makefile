@@ -25,3 +25,12 @@ db-logs:
 
 db-shell:
 	docker exec -it astria_postgres psql -U astria_user -d astria_db
+
+DB_URL=postgres://astria_user:astria_password@localhost:5432/astria_db?sslmode=disable
+MIGRATIONS_PATH=migrations
+
+migrate-up:
+	migrate -path $(MIGRATIONS_PATH) -database "$(DB_URL)" up
+
+migrate-down:
+	migrate -path $(MIGRATIONS_PATH) -database "$(DB_URL)" down 1
