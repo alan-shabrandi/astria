@@ -47,7 +47,7 @@ func NewBatchEmbedder(provider domain.EmbeddingProvider, formatter ChunkFormatte
 	}
 }
 
-// EmbedChunks processes chunks concurrently with memory pooling and rate limiting.
+// EmbedChunks processes chunks concurrently with memory pooling, rate limiting, and safe error propagation.
 func (b *BatchEmbedder) EmbedChunks(ctx context.Context, chunks []domain.CodeChunk) ([]domain.CodeChunk, error) {
 	if len(chunks) == 0 {
 		return chunks, nil
@@ -57,14 +57,25 @@ func (b *BatchEmbedder) EmbedChunks(ctx context.Context, chunks []domain.CodeChu
 	embeddedChunks := make([]domain.CodeChunk, totalChunks)
 	copy(embeddedChunks, chunks)
 
-	sem := make(chan struct{}, b.maxWorkers)
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
+	sem := make(chan struct{}, b.maxWorkers)
 	ticker := time.NewTicker(b.requestRate)
 	defer ticker.Stop()
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 1)
+	var once sync.Once
+	var firstErr error
 
+	setErr := func(err error) {
+		once.Do(func() {
+			firstErr = err
+			cancel()
+		})
+	}
+
+ProcessingLoop:
 	for i := 0; i < totalChunks; i += b.batchSize {
 		end := i + b.batchSize
 		if end > totalChunks {
@@ -72,15 +83,28 @@ func (b *BatchEmbedder) EmbedChunks(ctx context.Context, chunks []domain.CodeChu
 		}
 
 		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("context cancelled before processing batch: %w", ctx.Err())
+		case <-subCtx.Done():
+			setErr(subCtx.Err())
+			break ProcessingLoop
 		case <-ticker.C:
-		case err := <-errCh:
-			return nil, err
+		}
+
+		if subCtx.Err() != nil {
+			break ProcessingLoop
 		}
 
 		wg.Add(1)
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-subCtx.Done():
+			wg.Done()
+			setErr(subCtx.Err())
+			break ProcessingLoop
+		}
+
+		if subCtx.Err() != nil {
+			break ProcessingLoop
+		}
 
 		go func(startIndex, endIndex int) {
 			defer wg.Done()
@@ -89,28 +113,23 @@ func (b *BatchEmbedder) EmbedChunks(ctx context.Context, chunks []domain.CodeChu
 			payloadsPtr := b.payloadPool.Get().(*[]string)
 			payloads := (*payloadsPtr)[:0]
 
-			defer b.payloadPool.Put(payloadsPtr)
-
 			batch := embeddedChunks[startIndex:endIndex]
 
 			for _, chunk := range batch {
 				payloads = append(payloads, b.formatter.Format(chunk))
 			}
 
-			vectors, err := b.provider.GenerateEmbeddings(ctx, payloads)
+			*payloadsPtr = payloads
+			defer b.payloadPool.Put(payloadsPtr)
+
+			vectors, err := b.provider.GenerateEmbeddings(subCtx, payloads)
 			if err != nil {
-				select {
-				case errCh <- fmt.Errorf("batch [%d:%d] failed: %w", startIndex, endIndex, err):
-				default:
-				}
+				setErr(fmt.Errorf("batch [%d:%d] failed: %w", startIndex, endIndex, err))
 				return
 			}
 
 			if len(vectors) != len(batch) {
-				select {
-				case errCh <- fmt.Errorf("vector length mismatch for batch [%d:%d]", startIndex, endIndex):
-				default:
-				}
+				setErr(fmt.Errorf("vector length mismatch for batch [%d:%d]", startIndex, endIndex))
 				return
 			}
 
@@ -121,10 +140,9 @@ func (b *BatchEmbedder) EmbedChunks(ctx context.Context, chunks []domain.CodeChu
 	}
 
 	wg.Wait()
-	close(errCh)
 
-	if err := <-errCh; err != nil {
-		return nil, err
+	if firstErr != nil {
+		return nil, firstErr
 	}
 
 	return embeddedChunks, nil

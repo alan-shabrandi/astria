@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"time"
@@ -57,7 +58,6 @@ func NewOpenAIProvider(apiKey string) *OpenAIProvider {
 	}
 }
 
-// GenerateEmbeddings converts a batch of texts into vector representations using Exponential Backoff.
 func (p *OpenAIProvider) GenerateEmbeddings(ctx context.Context, texts []string) ([]domain.Vector, error) {
 	if len(texts) == 0 {
 		return nil, nil
@@ -114,7 +114,6 @@ func (p *OpenAIProvider) GenerateEmbeddings(ctx context.Context, texts []string)
 	return nil, fmt.Errorf("failed after %d attempts, last error: %w", maxRetries+1, lastErr)
 }
 
-// doSingleRequest isolates a single HTTP call to prevent memory leaks from deferred Body closures in loops.
 func (p *OpenAIProvider) doSingleRequest(ctx context.Context, payload []byte) (*openAIResponse, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, openAIEndpoint, bytes.NewReader(payload))
 	if err != nil {
@@ -130,25 +129,35 @@ func (p *OpenAIProvider) doSingleRequest(ctx context.Context, payload []byte) (*
 	}
 	defer resp.Body.Close()
 
-	var apiResp openAIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return nil, false, fmt.Errorf("failed to decode api response: %w", err)
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, true, fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		isRetryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError
 
+		var apiErr openAIResponse
+		_ = json.Unmarshal(bodyBytes, &apiErr)
+
 		errMsg := "unknown api error"
-		if apiResp.Error != nil {
-			errMsg = apiResp.Error.Message
+		if apiErr.Error != nil && apiErr.Error.Message != "" {
+			errMsg = apiErr.Error.Message
+		} else if len(bodyBytes) > 0 {
+			errMsg = string(bodyBytes)
 		}
+
 		return nil, isRetryable, fmt.Errorf("openai error (status %d): %s", resp.StatusCode, errMsg)
+	}
+
+	var apiResp openAIResponse
+	if err := json.Unmarshal(bodyBytes, &apiResp); err != nil {
+		return nil, false, fmt.Errorf("failed to decode api response: %w", err)
 	}
 
 	return &apiResp, false, nil
 }
 
-// Dimensions returns the expected vector dimension for the embedding model.
 func (p *OpenAIProvider) Dimensions() int {
 	return 1536
 }
