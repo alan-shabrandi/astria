@@ -8,3 +8,9 @@ type SourceFile struct {
 	Size      int64  // File size in bytes
 	Content   []byte // Raw content of the file
 }
+
+// FileResult is used by the scanner to safely pass files and errors through a single channel.
+type FileResult struct {
+	File SourceFile
+	Err  error
+}

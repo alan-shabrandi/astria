@@ -4,12 +4,11 @@ import "context"
 
 // FileScanner defines the contract for traversing directories and extracting source files.
 type FileScanner interface {
-	Scan(ctx context.Context, rootDir string) (<-chan SourceFile, <-chan error)
+	// Scan uses a single channel with FileResult to prevent goroutine leaks
+	// and simplify consumer loops.
+	Scan(ctx context.Context, rootDir string) <-chan FileResult
 }
 
 type ASTChunker interface {
 	ChunkFile(ctx context.Context, file SourceFile) ([]CodeChunk, error)
-}
-type EmbeddingService interface {
-	GenerateEmbeddings(ctx context.Context, texts []string) ([][]float32, error)
 }

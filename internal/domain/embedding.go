@@ -7,13 +7,10 @@ import "context"
 type Vector []float32
 
 // EmbeddingProvider defines the contract for any service that converts text into vector embeddings.
-// By keeping this in the domain layer, the core application remains agnostic to the specific AI provider (OpenAI, Ollama, etc.).
 type EmbeddingProvider interface {
 	// GenerateEmbeddings takes a batch of strings and returns their corresponding vector representations.
-	// Processing in batches is highly recommended to optimize network overhead and API rate limits.
 	GenerateEmbeddings(ctx context.Context, texts []string) ([]Vector, error)
 
 	// Dimensions returns the exact size of the generated vectors.
-	// This is required for initializing the pgvector columns dynamically.
 	Dimensions() int
 }

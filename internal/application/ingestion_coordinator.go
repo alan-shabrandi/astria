@@ -3,7 +3,7 @@ package application
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/alanshabrandi/astria/internal/domain"
 )
@@ -13,71 +13,88 @@ import (
 type IngestionCoordinator struct {
 	scanner   domain.FileScanner
 	chunker   domain.ASTChunker
-	embedder  domain.EmbeddingService
+	embedder  domain.EmbeddingProvider
 	repo      domain.ChunkRepository
 	batchSize int
+	logger    *slog.Logger
 }
 
 func NewIngestionCoordinator(
 	scanner domain.FileScanner,
 	chunker domain.ASTChunker,
-	embedder domain.EmbeddingService,
+	embedder domain.EmbeddingProvider,
 	repo domain.ChunkRepository,
 	batchSize int,
+	logger *slog.Logger,
 ) *IngestionCoordinator {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &IngestionCoordinator{
 		scanner:   scanner,
 		chunker:   chunker,
 		embedder:  embedder,
 		repo:      repo,
 		batchSize: batchSize,
+		logger:    logger,
 	}
 }
 
 // ProcessRepository is the main entry point for the pipeline.
 func (c *IngestionCoordinator) ProcessRepository(ctx context.Context, repoPath string, repoName string) error {
-	log.Printf("Starting ingestion for repository: %s at %s", repoName, repoPath)
+	c.logger.Info("Starting ingestion for repository",
+		slog.String("repo_name", repoName),
+		slog.String("repo_path", repoPath),
+	)
 
-	files, errCh := c.scanner.Scan(ctx, repoPath)
+	// Stream file results using single-channel pattern to prevent leaks
+	fileResults := c.scanner.Scan(ctx, repoPath)
 
-	var chunkBuffer []domain.CodeChunk
+	chunkBuffer := make([]domain.CodeChunk, 0, c.batchSize)
 
-	for file := range files {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+	for res := range fileResults {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
-		chunks, err := c.chunker.ChunkFile(ctx, file)
-		if err != nil {
-			log.Printf("Warning: failed to chunk file %v: %v", file, err)
+		if res.Err != nil {
+			c.logger.Warn("Failed to scan file",
+				slog.String("file", res.File.Path),
+				slog.Any("error", res.Err),
+			)
 			continue
 		}
 
-		chunkBuffer = append(chunkBuffer, chunks...)
+		chunks, err := c.chunker.ChunkFile(ctx, res.File)
+		if err != nil {
+			c.logger.Warn("Failed to chunk file",
+				slog.String("file", res.File.Path),
+				slog.Any("error", err),
+			)
+			continue
+		}
 
-		for len(chunkBuffer) >= c.batchSize {
-			batch := chunkBuffer[:c.batchSize]
-			chunkBuffer = chunkBuffer[c.batchSize:]
+		for _, chunk := range chunks {
+			chunkBuffer = append(chunkBuffer, chunk)
 
-			if err := c.processBatch(ctx, repoName, batch); err != nil {
-				return err
+			if len(chunkBuffer) >= c.batchSize {
+				if err := c.processBatch(ctx, repoName, chunkBuffer); err != nil {
+					return fmt.Errorf("failed processing batch: %w", err)
+				}
+				// Reset slice length while maintaining allocated memory capacity
+				chunkBuffer = chunkBuffer[:0]
 			}
 		}
 	}
 
+	// Flush remaining chunks in buffer
 	if len(chunkBuffer) > 0 {
 		if err := c.processBatch(ctx, repoName, chunkBuffer); err != nil {
-			return err
+			return fmt.Errorf("failed processing final batch: %w", err)
 		}
 	}
 
-	if err := <-errCh; err != nil {
-		return fmt.Errorf("failed to scan files: %w", err)
-	}
-
-	log.Printf("Successfully ingested repository: %s", repoName)
+	c.logger.Info("Successfully ingested repository", slog.String("repo_name", repoName))
 	return nil
 }
 
@@ -85,7 +102,8 @@ func (c *IngestionCoordinator) ProcessRepository(ctx context.Context, repoPath s
 func (c *IngestionCoordinator) processBatch(ctx context.Context, repoName string, chunks []domain.CodeChunk) error {
 	texts := make([]string, len(chunks))
 	for i, chunk := range chunks {
-		texts[i] = fmt.Sprintf("%s\n%s", chunk.Signature, chunk.Content)
+		// Encapsulated method including Type, Name, Signature, DocComment, and Content
+		texts[i] = chunk.PrepareForEmbedding()
 	}
 
 	vectors, err := c.embedder.GenerateEmbeddings(ctx, texts)
@@ -105,6 +123,6 @@ func (c *IngestionCoordinator) processBatch(ctx context.Context, repoName string
 		return fmt.Errorf("failed to insert chunks into db: %w", err)
 	}
 
-	log.Printf("Successfully processed and saved batch of %d chunks", len(chunks))
+	c.logger.Info("Saved chunk batch", slog.Int("count", len(chunks)))
 	return nil
 }
