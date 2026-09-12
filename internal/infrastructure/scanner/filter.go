@@ -1,17 +1,18 @@
 package scanner
 
 import (
-	"bufio"
 	"os"
 	"path/filepath"
 	"strings"
+
+	ignore "github.com/sabhiram/go-gitignore"
 )
 
 // Filter rules for skipping non-source files and system/binary directories.
 type Filter struct {
-	ignoredDirs    map[string]struct{}
-	ignoredExts    map[string]struct{}
-	gitIgnoreRules []string
+	ignoredDirs map[string]struct{}
+	ignoredExts map[string]struct{}
+	gitIgnore   *ignore.GitIgnore
 }
 
 // NewFilter initializes default filters and loads root .gitignore if present.
@@ -41,23 +42,16 @@ func NewFilter(rootDir string) *Filter {
 	return f
 }
 
+// loadGitIgnore compiles the rules from the given .gitignore file path.
 func (f *Filter) loadGitIgnore(gitIgnorePath string) {
-	file, err := os.Open(gitIgnorePath)
-	if err != nil {
-		return
+	if _, err := os.Stat(gitIgnorePath); os.IsNotExist(err) {
+		return // No .gitignore found, silently continue
 	}
-	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		f.gitIgnoreRules = append(f.gitIgnoreRules, line)
-	}
-	if err := scanner.Err(); err != nil {
-		return
+	// CompileIgnoreFile safely parses the standard gitignore syntax
+	ign, err := ignore.CompileIgnoreFile(gitIgnorePath)
+	if err == nil {
+		f.gitIgnore = ign
 	}
 }
 
@@ -65,25 +59,23 @@ func (f *Filter) loadGitIgnore(gitIgnorePath string) {
 func (f *Filter) ShouldIgnore(path string, isDir bool) bool {
 	base := filepath.Base(path)
 
+	// 1. Fast path: check hardcoded standard ignored directories
 	if isDir {
 		if _, exists := f.ignoredDirs[base]; exists {
 			return true
 		}
 	} else {
+		// 2. Fast path: check hardcoded standard ignored extensions
 		ext := strings.ToLower(filepath.Ext(path))
 		if _, exists := f.ignoredExts[ext]; exists {
 			return true
 		}
 	}
 
-	for _, rule := range f.gitIgnoreRules {
-		cleanRule := strings.TrimPrefix(strings.TrimSuffix(rule, "/"), "/")
-		if base == cleanRule || strings.Contains(path, filepath.FromSlash(cleanRule)) {
-			return true
-		}
-		if matched, _ := filepath.Match(rule, base); matched {
-			return true
-		}
+	// 3. Robust path: check against compiled .gitignore rules
+	if f.gitIgnore != nil {
+		// MatchesPath safely evaluates Git Ignore patterns (like **, !, trailing slashes, etc.)
+		return f.gitIgnore.MatchesPath(path)
 	}
 
 	return false

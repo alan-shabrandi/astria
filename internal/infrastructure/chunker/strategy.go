@@ -2,6 +2,7 @@ package chunker
 
 import (
 	"fmt"
+
 	"github.com/alanshabrandi/astria/internal/domain"
 	"github.com/alanshabrandi/astria/internal/infrastructure/parser"
 	sitter "github.com/smacker/go-tree-sitter"
@@ -22,12 +23,16 @@ func NewDefaultChunkingStrategy(lang string) *DefaultChunkingStrategy {
 }
 
 func (s *DefaultChunkingStrategy) Process(file domain.SourceFile, tree *sitter.Tree, extractor *parser.Extractor) ([]domain.CodeChunk, error) {
-	var chunks []domain.CodeChunk
-
 	structs, err := extractor.ExtractStructures(tree, file.Content, file.Extension)
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract structures: %w", err)
 	}
+	funcs, err := extractor.ExtractFunctions(tree, file.Content, file.Extension)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract functions: %w", err)
+	}
+
+	chunks := make([]domain.CodeChunk, 0, len(structs)+len(funcs))
 
 	for _, st := range structs {
 		chunks = append(chunks, domain.CodeChunk{
@@ -40,11 +45,6 @@ func (s *DefaultChunkingStrategy) Process(file domain.SourceFile, tree *sitter.T
 			EndLine:    st.EndPoint.Row + 1,
 			Content:    st.Content,
 		})
-	}
-
-	funcs, err := extractor.ExtractFunctions(tree, file.Content, file.Extension)
-	if err != nil {
-		return nil, fmt.Errorf("failed to extract functions: %w", err)
 	}
 
 	for _, fn := range funcs {

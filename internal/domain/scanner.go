@@ -8,7 +8,3 @@ type FileScanner interface {
 	// and simplify consumer loops.
 	Scan(ctx context.Context, rootDir string) <-chan FileResult
 }
-
-type ASTChunker interface {
-	ChunkFile(ctx context.Context, file SourceFile) ([]CodeChunk, error)
-}

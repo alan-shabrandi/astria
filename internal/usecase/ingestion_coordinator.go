@@ -1,9 +1,11 @@
-package application
+package usecase
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
+	"time"
 
 	"github.com/alanshabrandi/astria/internal/domain"
 )
@@ -54,7 +56,7 @@ func (c *IngestionCoordinator) ProcessRepository(ctx context.Context, repoPath s
 
 	for res := range fileResults {
 		if err := ctx.Err(); err != nil {
-			return err
+			return fmt.Errorf("ingestion cancelled: %w", err)
 		}
 
 		if res.Err != nil {
@@ -106,9 +108,10 @@ func (c *IngestionCoordinator) processBatch(ctx context.Context, repoName string
 		texts[i] = chunk.PrepareForEmbedding()
 	}
 
-	vectors, err := c.embedder.GenerateEmbeddings(ctx, texts)
+	// Generate embeddings with Exponential Backoff Retry mechanism
+	vectors, err := c.generateEmbeddingsWithRetry(ctx, texts)
 	if err != nil {
-		return fmt.Errorf("failed to generate embeddings: %w", err)
+		return fmt.Errorf("failed to generate embeddings after retries: %w", err)
 	}
 
 	if len(vectors) != len(chunks) {
@@ -125,4 +128,49 @@ func (c *IngestionCoordinator) processBatch(ctx context.Context, repoName string
 
 	c.logger.Info("Saved chunk batch", slog.Int("count", len(chunks)))
 	return nil
+}
+
+// generateEmbeddingsWithRetry calls embedding provider using Exponential Backoff to handle Rate Limits (HTTP 429).
+func (c *IngestionCoordinator) generateEmbeddingsWithRetry(ctx context.Context, texts []string) ([]domain.Vector, error) {
+	const (
+		maxAttempts = 5
+		baseDelay   = 500 * time.Millisecond
+		maxDelay    = 8 * time.Second
+	)
+
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		vectors, err := c.embedder.GenerateEmbeddings(ctx, texts)
+		if err == nil {
+			return vectors, nil
+		}
+
+		lastErr = err
+
+		if attempt == maxAttempts {
+			break
+		}
+
+		// Calculate delay: baseDelay * 2^(attempt-1)
+		delay := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt-1)))
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+
+		c.logger.Warn("Embedding generation failed, retrying with exponential backoff",
+			slog.Int("attempt", attempt),
+			slog.Int("max_attempts", maxAttempts),
+			slog.Duration("backoff_delay", delay),
+			slog.Any("error", err),
+		)
+
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	return nil, fmt.Errorf("exceeded max retry attempts (%d): %w", maxAttempts, lastErr)
 }

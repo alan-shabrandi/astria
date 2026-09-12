@@ -33,12 +33,12 @@ func (c *ASTChunker) ChunkFile(ctx context.Context, file domain.SourceFile) ([]d
 		return nil, nil
 	}
 
-	tree, err := c.engine.Parse(ctx, file.Content, file.Extension)
+	tree, cleanup, err := c.engine.Parse(ctx, file.Content, file.Extension)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse file %s: %w", file.Path, err)
 	}
 
-	defer tree.Close()
+	defer cleanup()
 
 	return strategy.Process(file, tree, c.extractor)
 }

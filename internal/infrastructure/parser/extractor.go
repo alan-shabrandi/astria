@@ -3,6 +3,7 @@ package parser
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	sitter "github.com/smacker/go-tree-sitter"
 )
@@ -32,32 +33,84 @@ type FunctionNode struct {
 
 // Extractor is responsible for running Tree-sitter queries on the AST.
 type Extractor struct {
-	registry *LanguageRegistry
+	registry   *LanguageRegistry
+	queryCache map[string]*sitter.Query
+	mu         sync.RWMutex
 }
 
 func NewExtractor(registry *LanguageRegistry) *Extractor {
 	return &Extractor{
-		registry: registry,
+		registry:   registry,
+		queryCache: make(map[string]*sitter.Query),
 	}
 }
 
-// ExtractStructures runs language-specific queries to find Structs, Interfaces, and Classes.
-func (e *Extractor) ExtractStructures(tree *sitter.Tree, content []byte, extension string) ([]StructuralNode, error) {
+// Close frees the C memory allocated for the cached queries.
+// Call this when the Extractor is no longer needed.
+func (e *Extractor) Close() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, q := range e.queryCache {
+		q.Close()
+	}
+	e.queryCache = make(map[string]*sitter.Query)
+}
+
+// getCompiledQuery safely fetches or compiles a query.
+func (e *Extractor) getCompiledQuery(extension, queryType string) (*sitter.Query, error) {
+	cacheKey := extension + "_" + queryType
+
+	// Fast path: Check if query is already compiled
+	e.mu.RLock()
+	q, exists := e.queryCache[cacheKey]
+	e.mu.RUnlock()
+	if exists {
+		return q, nil
+	}
+
+	// Slow path: Compile the query
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Double-check locking
+	if q, exists := e.queryCache[cacheKey]; exists {
+		return q, nil
+	}
+
+	var queryStr string
+	if queryType == "structure" {
+		queryStr = e.getStructureQuery(extension)
+	} else {
+		queryStr = e.getFunctionQuery(extension)
+	}
+
+	if queryStr == "" {
+		return nil, nil // No query defined for this language
+	}
+
 	lang, err := e.registry.GetGrammar(extension)
 	if err != nil {
 		return nil, fmt.Errorf("unsupported extension for extraction: %w", err)
-	}
-
-	queryStr := e.getStructureQuery(extension)
-	if queryStr == "" {
-		return nil, nil // No structural query defined for this language yet
 	}
 
 	query, err := sitter.NewQuery([]byte(queryStr), lang)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compile tree-sitter query: %w", err)
 	}
-	defer query.Close()
+
+	e.queryCache[cacheKey] = query
+	return query, nil
+}
+
+// ExtractStructures runs language-specific queries to find Structs, Interfaces, and Classes.
+func (e *Extractor) ExtractStructures(tree *sitter.Tree, content []byte, extension string) ([]StructuralNode, error) {
+	query, err := e.getCompiledQuery(extension, "structure")
+	if err != nil {
+		return nil, err
+	}
+	if query == nil {
+		return nil, nil
+	}
 
 	cursor := sitter.NewQueryCursor()
 	defer cursor.Close()
@@ -109,21 +162,13 @@ func (e *Extractor) ExtractStructures(tree *sitter.Tree, content []byte, extensi
 
 // ExtractFunctions runs language-specific queries to find Functions and Methods.
 func (e *Extractor) ExtractFunctions(tree *sitter.Tree, content []byte, extension string) ([]FunctionNode, error) {
-	lang, err := e.registry.GetGrammar(extension)
+	query, err := e.getCompiledQuery(extension, "function")
 	if err != nil {
-		return nil, fmt.Errorf("unsupported extension for function extraction: %w", err)
+		return nil, err
 	}
-
-	queryStr := e.getFunctionQuery(extension)
-	if queryStr == "" {
+	if query == nil {
 		return nil, nil
 	}
-
-	query, err := sitter.NewQuery([]byte(queryStr), lang)
-	if err != nil {
-		return nil, fmt.Errorf("failed to compile function tree-sitter query: %w", err)
-	}
-	defer query.Close()
 
 	cursor := sitter.NewQueryCursor()
 	defer cursor.Close()
@@ -131,7 +176,6 @@ func (e *Extractor) ExtractFunctions(tree *sitter.Tree, content []byte, extensio
 	cursor.Exec(query, tree.RootNode())
 
 	var nodes []FunctionNode
-	var currentNode FunctionNode
 
 	for {
 		match, ok := cursor.NextMatch()
@@ -139,7 +183,7 @@ func (e *Extractor) ExtractFunctions(tree *sitter.Tree, content []byte, extensio
 			break
 		}
 
-		currentNode = FunctionNode{}
+		var currentNode FunctionNode
 
 		for _, capture := range match.Captures {
 			captureName := query.CaptureNameForId(capture.Index)
@@ -183,15 +227,15 @@ func (e *Extractor) getStructureQuery(extension string) string {
 			(type_spec
 				name: (type_identifier) @struct.name
 				type: (struct_type)
-			)
-		) @struct.decl
+			) @struct.decl
+		)
 
 		(type_declaration
 			(type_spec
 				name: (type_identifier) @interface.name
 				type: (interface_type)
-			)
-		) @interface.decl
+			) @interface.decl
+		)
 		`
 	case ".py":
 		return `
@@ -240,8 +284,17 @@ func (e *Extractor) extractDocComment(node *sitter.Node, content []byte, extensi
 		var comments []string
 		prev := node.PrevNamedSibling()
 
+		// Track the row of the target node to detect blank lines
+		lastRow := node.StartPoint().Row
+
 		for prev != nil && prev.Type() == "comment" {
+			// If there is more than 1 line gap, this comment is completely separate (not a doc comment)
+			if lastRow-prev.EndPoint().Row > 1 {
+				break
+			}
+
 			comments = append([]string{prev.Content(content)}, comments...)
+			lastRow = prev.StartPoint().Row
 			prev = prev.PrevNamedSibling()
 		}
 		return strings.Join(comments, "\n")

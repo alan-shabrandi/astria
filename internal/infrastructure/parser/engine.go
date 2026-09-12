@@ -20,12 +20,14 @@ func NewEngine(registry *LanguageRegistry) *Engine {
 }
 
 // Parse generates an Abstract Syntax Tree (AST) for the given source code.
-// IMPORTANT: The caller is responsible for calling Close() on the returned *sitter.Tree
-// to prevent memory leaks in the underlying C library.
-func (e *Engine) Parse(ctx context.Context, content []byte, extension string) (*sitter.Tree, error) {
+// It returns the parsed tree, a cleanup function to prevent CGO memory leaks, and an error.
+// IMPORTANT: The caller MUST call the returned cleanup function (e.g., using defer).
+func (e *Engine) Parse(ctx context.Context, content []byte, extension string) (*sitter.Tree, func(), error) {
+	noop := func() {}
+
 	lang, err := e.registry.GetGrammar(extension)
 	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve grammar for extension %s: %w", extension, err)
+		return nil, noop, fmt.Errorf("failed to retrieve grammar for extension %s: %w", extension, err)
 	}
 
 	parser := sitter.NewParser()
@@ -35,8 +37,14 @@ func (e *Engine) Parse(ctx context.Context, content []byte, extension string) (*
 
 	tree, err := parser.ParseCtx(ctx, nil, content)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse syntax tree: %w", err)
+		return nil, noop, fmt.Errorf("failed to parse syntax tree: %w", err)
 	}
 
-	return tree, nil
+	cleanup := func() {
+		if tree != nil {
+			tree.Close()
+		}
+	}
+
+	return tree, cleanup, nil
 }

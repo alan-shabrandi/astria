@@ -1,11 +1,16 @@
 package domain
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
 	"strings"
 )
+
+type ASTChunker interface {
+	ChunkFile(ctx context.Context, file SourceFile) ([]CodeChunk, error)
+}
 
 // ChunkType defines the structural category of the extracted code.
 type ChunkType string
@@ -63,11 +68,11 @@ func (c *CodeChunk) PrepareForEmbedding() string {
 func (c *CodeChunk) CalculateHash() string {
 	hasher := sha256.New()
 
-	io.WriteString(hasher, c.FilePath)
-	io.WriteString(hasher, ":")
-	io.WriteString(hasher, c.Signature)
-	io.WriteString(hasher, ":")
-	io.WriteString(hasher, c.Content)
+	_, _ = io.WriteString(hasher, c.FilePath)
+	_, _ = io.WriteString(hasher, ":")
+	_, _ = io.WriteString(hasher, c.Signature)
+	_, _ = io.WriteString(hasher, ":")
+	_, _ = io.WriteString(hasher, c.Content)
 
 	return hex.EncodeToString(hasher.Sum(nil))
 }

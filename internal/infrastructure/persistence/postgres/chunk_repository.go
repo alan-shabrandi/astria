@@ -3,13 +3,13 @@ package postgres
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/alanshabrandi/astria/internal/domain"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/pgvector/pgvector-go"
 )
+
+const maxBatchSize = 500
 
 type ChunkRepository struct {
 	pool *pgxpool.Pool
@@ -22,7 +22,7 @@ func NewChunkRepository(pool *pgxpool.Pool) *ChunkRepository {
 }
 
 // BatchInsert inserts a list of code chunks into PostgreSQL concurrently using pgx.Batch.
-// It uses ON CONFLICT DO NOTHING based on (repo_name, content_hash) for idempotency.
+// It automatically splits large slices into smaller batches to prevent memory spikes and timeouts.
 func (r *ChunkRepository) BatchInsert(ctx context.Context, repoName string, chunks []domain.CodeChunk) error {
 	if len(chunks) == 0 {
 		return nil
@@ -41,42 +41,43 @@ func (r *ChunkRepository) BatchInsert(ctx context.Context, repoName string, chun
 		ON CONFLICT (repo_name, content_hash) DO NOTHING;
 	`
 
-	batch := &pgx.Batch{}
-	now := time.Now()
+	for i := 0; i < len(chunks); i += maxBatchSize {
+		end := i + maxBatchSize
+		if end > len(chunks) {
+			end = len(chunks)
+		}
 
-	for _, chunk := range chunks {
-		contentHash := chunk.CalculateHash()
+		currentBatchChunks := chunks[i:end]
+		batch := &pgx.Batch{}
 
-		vectorParam := pgvector.NewVector(chunk.Vector)
+		for _, chunk := range currentBatchChunks {
+			m := FromDomain(repoName, chunk)
+			batch.Queue(
+				query,
+				m.RepoName, m.FilePath, m.Language, m.ChunkType, m.Name,
+				m.Signature, m.DocComment, m.Content, m.StartLine, m.EndLine,
+				m.ContentHash, m.Embedding, m.CreatedAt, m.UpdatedAt,
+			)
+		}
 
-		batch.Queue(
-			query,
-			repoName,
-			chunk.FilePath,
-			chunk.Language,
-			string(chunk.Type),
-			chunk.Name,
-			chunk.Signature,
-			chunk.DocComment,
-			chunk.Content,
-			chunk.StartLine,
-			chunk.EndLine,
-			contentHash,
-			vectorParam,
-			now,
-			now,
-		)
+		if err := r.executeBatch(ctx, batch, len(currentBatchChunks)); err != nil {
+			return fmt.Errorf("failed to process chunk batch starting at index %d: %w", i, err)
+		}
 	}
 
+	return nil
+}
+
+// executeBatch is a helper method to safely execute a batch and ensure br.Close()
+// is called immediately after execution, preventing resource leaks in loops.
+func (r *ChunkRepository) executeBatch(ctx context.Context, batch *pgx.Batch, count int) error {
 	br := r.pool.SendBatch(ctx, batch)
 	defer br.Close()
 
-	for i := 0; i < len(chunks); i++ {
-		ct, err := br.Exec()
-		if err != nil {
-			return fmt.Errorf("failed to execute chunk insert at index %d: %w", i, err)
+	for i := 0; i < count; i++ {
+		if _, err := br.Exec(); err != nil {
+			return fmt.Errorf("failed to execute chunk insert at batch index %d: %w", i, err)
 		}
-		_ = ct
 	}
 
 	return nil
